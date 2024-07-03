@@ -5,9 +5,9 @@ import sys
 class AdvCfg():
     def __init__(self):
         self.g_cfg = dict()
-        self.g_cfg['g_num_modes'] = 6
+        self.g_cfg['g_num_modes'] = 6 # mode代表一个agent预测的轨迹数量
         self.g_cfg['g_obs_len'] = 20
-        self.g_cfg['g_pred_len'] = 30
+        self.g_cfg['g_pred_len'] = 50
 
     def get_dataset_cfg(self):
         data_cfg = dict()
@@ -34,7 +34,7 @@ class AdvCfg():
         net_cfg["dropout"] = 0.1
         net_cfg["update_edge"] = True
 
-        net_cfg["param_out"] = 'none'  # bezier/monomial/none
+        net_cfg["param_out"] = 'bezier'  # bezier/monomial/none
         net_cfg["param_order"] = 5     # 5-th order polynomials
 
         net_cfg.update(self.g_cfg)  # append global config

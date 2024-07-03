@@ -122,7 +122,9 @@ if __name__ == "__main__":
     os.makedirs(save_dir, exist_ok=True)
     print('save processed dataset to {}'.format(save_dir))
 
-    Parallel(n_jobs=n_proc)(delayed(load_seq_save_features)(args, i, batch_size, sequences, save_dir, k)
-                            for i, k in zip(range(0, num_sequences, batch_size), range(len(range(0, num_sequences, batch_size)))))
+    # Parallel(n_jobs=n_proc)(delayed(load_seq_save_features)(args, i, batch_size, sequences, save_dir, k)
+                            # for i, k in zip(range(0, num_sequences, batch_size), range(len(range(0, num_sequences, batch_size)))))
+    load_seq_save_features(args, 0, batch_size, sequences, save_dir, 0)
+
 
     print(f"Preprocess for {args.mode} set completed in {(time.time()-start)/60.0:.2f} mins")

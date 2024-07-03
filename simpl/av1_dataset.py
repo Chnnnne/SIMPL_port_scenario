@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import Dataset
 #
 from utils.utils import from_numpy
+import pickle
 
 
 class ArgoDataset(Dataset):
@@ -26,7 +27,7 @@ class ArgoDataset(Dataset):
 
         self.dataset_files = []
         self.dataset_len = -1
-        self.prepare_dataset(dataset_dir)
+        self.prepare_dataset(dataset_dir) # assign dataset_files
 
         self.obs_len = obs_len
         self.pred_len = pred_len
@@ -65,75 +66,165 @@ class ArgoDataset(Dataset):
         return self.dataset_len
 
     def __getitem__(self, idx):
-        df = pd.read_pickle(self.dataset_files[idx])
+        data_path = self.dataset_files[idx]
+        with open(data_path, "rb") as f:
+            data_dict = pickle.load(f)
+        data = {}
+        data['SEQ_ID'] = data_path.split('/')[-1][:-4]
+        data['CITY_NAME'] = "YongZhou"
+        data['ORIG'] = data_dict['agent_ctrs'][0] # 2
+        cos_, sin_ = data_dict['agent_vecs'][0]
+        data['ROT'] = np.array([[cos_, -sin_],[sin_, cos_]]) # 2,2
+        
+        data['TRAJS_OBS'] = data_dict['agent_feats'][:,:,:2] # n,20,2 此处读取的是pkl中all_agent的历史信息。由于all agent是最大值，所以此处没有关于agent的pad只有帧的pad
+        # 检查数组是否包含 Inf 值
+        if np.isinf(data['TRAJS_OBS']).any():
+            print("The array contains Inf values            ||| \n")
+        data['TRAJS_FUT'] = data_dict['gt_preds'] # n,50,2
+        data['TRAJS_FUT'][0] = data_dict['ego_gt_traj'] # 50, 2
+        data['PAD_OBS'] = data_dict['agent_mask'] # n, 20
+        agent_num = data_dict['agent_mask'].shape[0] # n包含target和surround
+        # pad_flag = np.sum(data['PAD_OBS'],axis=-1) > 0 # n
+        pad_flag = data_dict['candidate_mask'].sum(-1) > 0 # N,M-> N->N
+        pad_future = np.zeros((agent_num,50),dtype=int)# n,50
+        pad_future[pad_flag] = 1
+
+        data['PAD_FUT'] = pad_future # n,50
+        data['TRAJS_CTRS'] = data_dict['agent_ctrs'] # n,2
+        data['TRAJS_VECS'] = data_dict['agent_vecs'] # n,2
+
+
+        graph = {}
         '''
-            "SEQ_ID", "CITY_NAME",
-            "ORIG", "ROT",
-            "TIMESTAMP", "TRAJS", "TRAJS_CTRS", "TRAJS_VECS", "PAD_FLAGS",
-            "LANE_GRAPH"
-        '''
+            lane-seg-points
+            1个lane,164个seg, 1个seg 10个point
 
-        data = self.data_augmentation(df)
-
-        seq_id = data['SEQ_ID']
-        city_name = data['CITY_NAME']
-        orig = data['ORIG']
-        rot = data['ROT']
-
-        # timestamp = data['TIMESTAMP']
-        trajs = data['TRAJS']
-        trajs_obs = trajs[:, :self.obs_len]
-        trajs_fut = trajs[:, self.obs_len:]
-
-        pad_flags = data['PAD_FLAGS']
-        pad_obs = pad_flags[:, :self.obs_len]
-        pad_fut = pad_flags[:, self.obs_len:]
-
-        trajs_ctrs = data['TRAJS_CTRS']
-        trajs_vecs = data['TRAJS_VECS']
-
-        graph = data['LANE_GRAPH']
-        # for k, v in graph.items():
-        #     print(k, type(v), v.shape if type(v) == np.ndarray else [])
-        '''
-            'node_ctrs'         (164, 10, 2)
-            'node_vecs'         (164, 10, 2)
+            graph结构：
+            'node_ctrs'         (164, 10, 2) 1
+            'node_vecs'         (164, 10, 2) 1
             'turn'              (164, 10, 2)
             'control'           (164, 10)
             'intersect'         (164, 10)
             'left'              (164, 10)
             'right'             (164, 10)
-            'lane_ctrs'         (164, 2)
-            'lane_vecs'         (164, 2)
+            'lane_ctrs'         (164, 2) 1
+            'lane_vecs'         (164, 2) 1
             'num_nodes'         1640
             'num_lanes'         164
             'rel_lane_flags'    (164,)
         '''
+        map_n = data_dict['map_feats'].shape[0]
 
-        lane_ctrs = graph['lane_ctrs']
-        lane_vecs = graph['lane_vecs']
+        graph['node_ctrs'] = data_dict['map_feats'][:,:,:2] # map_n, 20,2
+        graph['node_vecs'] = data_dict['map_feats'][:,:,2:4] # map_n, 20,2
+        graph['turn'] = np.zeros_like(graph['node_vecs']) # map_n, 20,2
 
-        # ~ calc rpe
-        rpes = dict()
-        scene_ctrs = torch.cat([torch.from_numpy(trajs_ctrs), torch.from_numpy(lane_ctrs)], dim=0)
-        scene_vecs = torch.cat([torch.from_numpy(trajs_vecs), torch.from_numpy(lane_vecs)], dim=0)
-        rpes['scene'], rpes['scene_mask'] = self._get_rpe(scene_ctrs, scene_vecs)
 
-        data = {}
-        data['SEQ_ID'] = seq_id
-        data['CITY_NAME'] = city_name
-        data['ORIG'] = orig
-        data['ROT'] = rot
-        data['TRAJS_OBS'] = trajs_obs
-        data['TRAJS_FUT'] = trajs_fut
-        data['PAD_OBS'] = pad_obs
-        data['PAD_FUT'] = pad_fut
-        data['TRAJS_CTRS'] = trajs_ctrs
-        data['TRAJS_VECS'] = trajs_vecs
-        data['LANE_GRAPH'] = graph
+        graph['control'] = np.zeros((map_n, 20)) # map_n, 20 
+        graph['intersect'] = np.zeros((map_n, 20)) # map_n, 20
+        graph['left'] = np.zeros((map_n, 20)) # map_n, 20
+        graph['right'] = np.zeros((map_n, 20)) # map_n, 20
+
+        graph['lane_ctrs'] = data_dict['map_ctrs'] # map_n, 2
+        graph['lane_vecs'] = data_dict['map_vecs'] # map_n, 2
+
+        graph['num_lanes'] = map_n
+        graph['num_nodes'] = graph['num_lanes'] * 20
+        graph['rel_lane_flags'] = np.zeros(map_n)
+
+        data['LANE_GRAPH'] = graph 
+        rpes= {}
+        rpes['scene'], rpes['scene_mask'] = data_dict['rpe'], None
+        rpes['scene'] = np.transpose(rpes['scene'], (2,0,1))
         data['RPE'] = rpes
 
         return data
+
+    # def __getitem__(self, idx):
+    #     df = pd.read_pickle(self.dataset_files[idx])
+    #     '''
+    #         "SEQ_ID", 
+    #         "CITY_NAME",
+    #         "ORIG", [1,2]
+    #         "ROT", [2,2]
+    #         "TIMESTAMP", (1,50)
+    #         "TRAJS", (n,50,2)
+    #         "TRAJS_CTRS", (n,2)
+    #         "TRAJS_VECS", (n,2)
+    #         "PAD_FLAGS",(n,50)
+
+    #         "LANE_GRAPH":
+    #             - node
+    #     '''
+
+    #     data = self.data_augmentation(df)
+
+    #     seq_id = data['SEQ_ID']
+    #     city_name = data['CITY_NAME']
+    #     orig = data['ORIG']
+    #     rot = data['ROT']
+
+    #     # timestamp = data['TIMESTAMP']
+    #     trajs = data['TRAJS']
+    #     trajs_obs = trajs[:, :self.obs_len]
+    #     trajs_fut = trajs[:, self.obs_len:]
+
+    #     pad_flags = data['PAD_FLAGS']
+    #     pad_obs = pad_flags[:, :self.obs_len]
+    #     pad_fut = pad_flags[:, self.obs_len:]
+
+    #     trajs_ctrs = data['TRAJS_CTRS'] # （num of object, 2）
+    #     trajs_vecs = data['TRAJS_VECS']
+
+    #     graph = data['LANE_GRAPH']
+    #     # for k, v in graph.items():
+    #     #     print(k, type(v), v.shape if type(v) == np.ndarray else [])
+    #     '''
+    #         lane-seg-points
+    #         1个lane,164个seg, 1个seg 10个point
+
+    #         graph结构：
+    #         'node_ctrs'         (164, 10, 2) 1
+    #         'node_vecs'         (164, 10, 2) 1
+    #         'turn'              (164, 10, 2)
+    #         'control'           (164, 10)
+    #         'intersect'         (164, 10)
+    #         'left'              (164, 10)
+    #         'right'             (164, 10)
+    #         'lane_ctrs'         (164, 2) 1
+    #         'lane_vecs'         (164, 2) 1
+    #         'num_nodes'         1640
+    #         'num_lanes'         164
+    #         'rel_lane_flags'    (164,)
+    #     '''
+
+    #     lane_ctrs = graph['lane_ctrs']
+    #     lane_vecs = graph['lane_vecs']
+
+    #     # ~ calc rpe
+    #     rpes = dict()
+    #     #  trajs_ctrs(每个object的obs处的坐标，以agent为坐标系, Na,2) cat with lane_ctrs(每个seg的中点, N_seg, 2)
+    #     # scene_ctrs  shape(Na+N_seg,2)
+    #     scene_ctrs = torch.cat([torch.from_numpy(trajs_ctrs), torch.from_numpy(lane_ctrs)], dim=0)# all,2
+    #     scene_vecs = torch.cat([torch.from_numpy(trajs_vecs), torch.from_numpy(lane_vecs)], dim=0)# all,2
+    #     rpes['scene'], rpes['scene_mask'] = self._get_rpe(scene_ctrs, scene_vecs)
+
+    #     data = {}
+    #     data['SEQ_ID'] = seq_id
+    #     data['CITY_NAME'] = city_name
+    #     data['ORIG'] = orig
+    #     data['ROT'] = rot
+    #     data['TRAJS_OBS'] = trajs_obs
+    #     data['TRAJS_FUT'] = trajs_fut
+    #     data['PAD_OBS'] = pad_obs
+    #     data['PAD_FUT'] = pad_fut
+    #     data['TRAJS_CTRS'] = trajs_ctrs
+    #     data['TRAJS_VECS'] = trajs_vecs
+
+    #     data['LANE_GRAPH'] = graph # 得到这些
+    #     data['RPE'] = rpes
+
+    #     return data
 
     def _get_cos(self, v1, v2):
         ''' input: [M, N, 2], [M, N, 2]
@@ -161,6 +252,8 @@ class ArgoDataset(Dataset):
 
     def _get_rpe(self, ctrs, vecs, radius=100.0):
         # distance encoding
+        # ctrs(Na+N_seg,2)
+        # return rpe shape(5, Na+N_seg, Na+N_seg)
         d_pos = (ctrs.unsqueeze(0) - ctrs.unsqueeze(1)).norm(dim=-1)
         if False:
             mask = d_pos >= radius
@@ -207,7 +300,8 @@ class ArgoDataset(Dataset):
             'LANE_GRAPH',
             'RPE'
         '''
-
+        # batch中每个sample按照key拆分成一个个list放进data dict里
+        # if torch.data['TRAJS_OBS']
         actors, actor_idcs = self.actor_gather(data['BATCH_SIZE'], data['TRAJS_OBS'], data['PAD_OBS'])
         lanes, lane_idcs = self.graph_gather(data['BATCH_SIZE'], data["LANE_GRAPH"])
 
@@ -218,19 +312,33 @@ class ArgoDataset(Dataset):
         return data
 
     def actor_gather(self, batch_size, actors, pad_flags):
-        num_actors = [len(x) for x in actors]
+        ''' 
+        input:
+            - data['TRAJS_OBS'] == actors  (bs, num_agent, 20, 2) 
+            - pad_flags (bs, num_agent, 20）
+        output:
+            - actors    (bs, Na, 3, 20)->(all_Num, 3, 20)
+            - actor_idcs    [tensor([0, 1, 2, 3]), tensor([ 4,  5,  6,  7,  8,  9, 10])] 每个sample(pkl)的agent在actors对应的idx
+        
+        '''
+        num_actors = [len(x) for x in actors]# 每个sample（pkl）的agent数量
 
         act_feats = []
-        for i in range(batch_size):
+        for i in range(batch_size):#遍历每个sample(pkl)
             # actors[i] (N_a, 20, 2)
             # pad_flags[i] (N_a, 20)
-            vel = torch.zeros_like(actors[i])
-            vel[:, 1:, :] = actors[i][:, 1:, :] - actors[i][:, :-1, :]
-            act_feats.append(torch.cat([vel, pad_flags[i].unsqueeze(2)], dim=2))
-        act_feats = [x.transpose(1, 2) for x in act_feats]
-        actors = torch.cat(act_feats, 0)  # [N_a, feat_len, 20], N_a is agent number in a batch
+            vel = torch.zeros_like(actors[i]) # vel:(N_a, 20, 2)
+            vel[:, 1:, :] = actors[i][:, 1:, :] - actors[i][:, :-1, :] # Na, 20, 2
+            act_feats.append(torch.cat([vel, pad_flags[i].unsqueeze(2)], dim=2)) # pad_flags[i] (N_a, 20, 1)  -> cat (Na, 20, 3) -> list[]
+        act_feats = [x.transpose(1, 2) for x in act_feats] # act_feats(bs, Na, 20, 3) - > (bs, Na, 3, 20)
+        actors = torch.cat(act_feats, 0)  #   (bs, Na, 3, 20)->(all_Num of batch, 3, 20)
+        if torch.isnan(actors).any():
+            print("atcor")
+            exit()
         actor_idcs = []  # e.g. [tensor([0, 1, 2, 3]), tensor([ 4,  5,  6,  7,  8,  9, 10])]
         count = 0
+        # 由于现在的actor组成形式是(all_Num of batch, 3, 20)  3代表xy_delta(也即xy方向上的v)和pad
+        # 所以要有actor_idcs
         for i in range(batch_size):
             idcs = torch.arange(count, count + num_actors[i])
             actor_idcs.append(idcs)
@@ -238,9 +346,10 @@ class ArgoDataset(Dataset):
         return actors, actor_idcs
 
     def graph_gather(self, batch_size, graphs):
+        # graphs:list  graphs[i]是一个sample的lane_graph
         '''
             graphs[i]
-                node_ctrs           torch.Size([116, 10, 2])
+                node_ctrs           torch.Size([116, 10, 2])  116是seg num, 10是每个seg等距采10个点，2是xy
                 node_vecs           torch.Size([116, 10, 2])
                 turn                torch.Size([116, 10, 2])
                 control             torch.Size([116, 10])
@@ -262,10 +371,10 @@ class ArgoDataset(Dataset):
 
         graph = dict()
         for key in ["node_ctrs", "node_vecs", "turn", "control", "intersect", "left", "right"]:
-            graph[key] = torch.cat([x[key] for x in graphs], 0)
+            graph[key] = torch.cat([x[key] for x in graphs], 0)#将每个sample的key字段堆叠在一起 graph[key] = (stack_num, 10, 2)
             # print(key, graph[key].shape)
         for key in ["lane_ctrs", "lane_vecs"]:
-            graph[key] = [x[key] for x in graphs]
+            graph[key] = [x[key] for x in graphs] # list
             # print(key, [x.shape for x in graph[key]])
 
         lanes = torch.cat([graph['node_ctrs'],
@@ -274,7 +383,7 @@ class ArgoDataset(Dataset):
                            graph['control'].unsqueeze(2),
                            graph['intersect'].unsqueeze(2),
                            graph['left'].unsqueeze(2),
-                           graph['right'].unsqueeze(2)], dim=-1)  # [N_{lane}, 10, F]
+                           graph['right'].unsqueeze(2)], dim=-1)  # [N_{lane}, 10, F] F=10= 2+2+2+1+1+1+1
 
         return lanes, lane_idcs
 

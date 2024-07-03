@@ -16,7 +16,9 @@ from loader import Loader
 from utils.logger import Logger
 from utils.utils import AverageMeterForDict
 from utils.utils import save_ckpt, set_seed
-
+from utils import time_utils as tu
+from utils import plot_utils as pu
+import matplotlib.pyplot as plt
 
 def parse_arguments() -> Any:
     """Arguments for running the baseline.
@@ -26,7 +28,7 @@ def parse_arguments() -> Any:
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default="train", type=str, help="Mode, train/val/test")
-    parser.add_argument("--features_dir", required=True, default="", type=str, help="Path to the dataset")
+    parser.add_argument("--features_dir", required=True, default="/private/wangchen/instance_model/instance_model_data_simpl/", type=str, help="Path to the dataset")
     parser.add_argument("--train_batch_size", type=int, default=16, help="Training batch size")
     parser.add_argument("--val_batch_size", type=int, default=16, help="Val batch size")
     parser.add_argument("--train_epoches", type=int, default=10, help="Number of epoches for training")
@@ -86,7 +88,7 @@ def main():
     best_metric = 1e6
     rank_metric = args.rank_metric
     net_name = loader.network_name()
-
+    print("d:begin_train")
     for epoch in range(args.train_epoches):
         logger.print('\nEpoch {}'.format(epoch))
         torch.cuda.empty_cache()
@@ -99,10 +101,17 @@ def main():
         net.train()
         for i, data in enumerate(tqdm(dl_train, disable=args.no_pbar, ncols=80)):
             data_in = net.pre_process(data)
+            # actors：(all_actor_Num of batch, 3, 20)  3代表xy_delta(也即xy方向上的v)和pad 20是obs_len
+            # actor_idcs :list  len = size of batch 因为actors包含了batch所有obejct，因此idcs为了指明哪个属于一个sample
+            # 同理lane:(all_lane_Num, 10, 10)  也即(all seg_num of batch, 每个seg采10个点, 堆叠后的维度10代表node_ctrs/turn/control等信息)
+            # rpe ,list len = bs, dict, scene = (5, x, x)    x= n_agent + n_lane
+            actors, actor_idcs, lanes, lane_idcs, rpe = data_in 
+            # print("d:",data_in)
             out = net(data_in)
-            loss_out = loss_fn(out, data)
 
-            post_out = net.post_process(out)
+            res_cls, res_reg, res_aux = out # res_cls(bs, agent_num, 6)     res_reg(bs, agent_num, 6, 30, 2)
+            loss_out = loss_fn(out, data)
+            post_out = net.post_process(out, data,draw=False)
             eval_out = evaluator.evaluate(post_out, data)
 
             optimizer.zero_grad()
@@ -140,7 +149,7 @@ def main():
                     out = net(data_in)
                     loss_out = loss_fn(out, data)
 
-                    post_out = net.post_process(out)
+                    post_out = net.post_process(out,data,draw= False)
                     eval_out = evaluator.evaluate(post_out, data)
 
                     val_loss_meter.update(loss_out)

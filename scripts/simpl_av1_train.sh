@@ -1,6 +1,6 @@
-CUDA_VISIBLE_DEVICES=0 python train.py \
-  --features_dir data_argo/features/ \
-  --train_batch_size 16 \
+CUDA_VISIBLE_DEVICES=1 python /data/wangchen/SIMPL/train.py \
+  --features_dir /private/wangchen/instance_model/instance_model_data_simpl/ \
+  --train_batch_size 8 \
   --val_batch_size 4 \
   --val_interval 2 \
   --train_epoches 30 \

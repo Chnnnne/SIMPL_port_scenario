@@ -12,7 +12,9 @@ from torch.nn import functional as F
 from torch.nn import MultiheadAttention
 
 from utils.utils import gpu, init_weights
-
+import utils.plot_utils as pu
+from pathlib import Path
+import utils.time_utils as time_utils
 
 class Conv1d(nn.Module):
     def __init__(self, n_in, n_out, kernel_size=3, stride=1, norm='GN', ng=32, act=True):
@@ -127,6 +129,8 @@ class ActorNet(nn.Module):
         self.output = Res1d(hidden_size, hidden_size, norm=norm, ng=ng)
 
     def forward(self, actors: Tensor) -> Tensor:
+        # 输入:(num obejct of a batch, 3, 20)
+        # 输出:(num object of a batch, d_actor128)
         out = actors
 
         outputs = []
@@ -136,7 +140,7 @@ class ActorNet(nn.Module):
 
         out = self.lateral[-1](outputs[-1])
         for i in range(len(outputs) - 2, -1, -1):
-            out = F.interpolate(out, scale_factor=2, mode="linear", align_corners=False)
+            out = F.interpolate(out, scale_factor=2, mode="linear", align_corners=False)#上采样， （维度）尺寸变换
             out += self.lateral[i](outputs[i])
 
         out = self.output(out)[:, :, -1]
@@ -195,9 +199,11 @@ class LaneNet(nn.Module):
         self.aggre2 = PointAggregateBlock(hidden_size=hidden_size, aggre_out=True, dropout=dropout)
 
     def forward(self, feats):
-        x = self.proj(feats)  # [N_{lane}, 10, hidden_size]
+        # input (all seg_num of batch, 10, 10)
+        # output (all seg_num of batch, 128)
+        x = self.proj(feats)  # ->[N_{lane}, 10, hidden_size128]  
         x = self.aggre1(x)
-        x = self.aggre2(x)  # [N_{lane}, hidden_size]
+        x = self.aggre2(x)  # ->[N_{lane}, hidden_size128]
         return x
 
 
@@ -528,18 +534,24 @@ class MLPDecoder(nn.Module):
     def forward(self,
                 embed: torch.Tensor,
                 actor_idcs: List[Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        # input embed: [159, 128]
-        embed = self.multihead_proj(embed).view(-1, self.num_modes, self.hidden_size).permute(1, 0, 2)
+        # input embed（actor token shape）: [159, 128]
+        '''
+        actors: (all_Num, 128)    all_Num = batch_size * sample_agent_num
+        actor_idcs: [tensor([0, 1, 2, 3]), tensor([ 4,  5,  6,  7,  8,  9, 10])] 每个sample(pkl)的agent在actors对应的idx
+        '''
+        embed = self.multihead_proj(embed).view(-1, self.num_modes, self.hidden_size).permute(1, 0, 2) # (all_Num, 128) - > (all_Num, 128 * self.num_modes) -> all_N, num_modes, 128 -> num_modes,all_N,128
         # print('embed: ', embed.shape)  # e.g., [6, 159, 128]
 
-        cls = self.cls(embed).view(self.num_modes, -1).permute(1, 0)  # e.g., [159, 6]
-        cls = F.softmax(cls * 1.0, dim=1)  # e.g., [159, 6]
+        # 1. 打分模块
+        cls = self.cls(embed).view(self.num_modes, -1).permute(1, 0)  #  embed(modes,all_N,128)-> cls->(modes,all_N,1) -> view/permute -> [all_N, modes]
+        cls = F.softmax(cls * 1.0, dim=1)  # [all_N, modes]每个objetc的6条轨迹分别给出概率
 
+        # 2. 回归模块
         if self.param_out == 'bezier':
-            param = self.reg(embed).view(self.num_modes, -1, self.N_ORDER + 1, 2)  # e.g., [6, 159, N_ORDER + 1, 2]
-            param = param.permute(1, 0, 2, 3)  # e.g., [159, 6, N_ORDER + 1, 2]
-            reg = torch.matmul(self.mat_T, param)  # e.g., [159, 6, 30, 2]
-            vel = torch.matmul(self.mat_Tp, torch.diff(param, dim=2)) / (self.future_steps * 0.1)
+            param = self.reg(embed).view(self.num_modes, -1, self.N_ORDER + 1, 2)  # num_modes,all_N,128->num_modes,all_N,(n+1)*2-> [mode, all_n, N_ORDER + 1, 2] 
+            param = param.permute(1, 0, 2, 3)  # [mode, all_n, N_ORDER + 1, 2]  -> [all_n,mode, N_ORDER + 1, 2] 
+            reg = torch.matmul(self.mat_T, param)  # [all_n, mode, T, 2] 
+            vel = torch.matmul(self.mat_Tp, torch.diff(param, dim=2)) / (self.future_steps * 0.1) # [all_n, mode, T, 2]   一阶导
         elif self.param_out == 'monomial':
             param = self.reg(embed).view(self.num_modes, -1, self.N_ORDER + 1, 2)  # e.g., [6, 159, N_ORDER + 1, 2]
             param = param.permute(1, 0, 2, 3)  # e.g., [159, 6, N_ORDER + 1, 2]
@@ -552,6 +564,10 @@ class MLPDecoder(nn.Module):
 
         # print('reg: ', reg.shape, 'cls: ', cls.shape)
         # de-batchify
+        # cls [all_N, modes]
+        # reg [all_n, mode, T, 2] 
+        # vel [all_n, mode, T, 2]   
+        # param [all_n, mode, N_ORDER + 1, 2] 
         res_cls, res_reg, res_aux = [], [], []
         for i in range(len(actor_idcs)):
             idcs = actor_idcs[i]
@@ -562,8 +578,14 @@ class MLPDecoder(nn.Module):
                 res_aux.append((vel[idcs], None))  # ! None is a placeholder
             else:
                 res_aux.append((vel[idcs], param[idcs]))  # List[Tuple[Tensor,...]]
-
-        return res_cls, res_reg, res_aux
+        ''' 
+        这三者都是list，每个item对应一个batch中的sample()，每个sample又对应n个agent和1个map全局信息，
+        每个item(type: tensor)的分别是
+        [samples_n, modes]
+        [samples_n,modes,T,2]
+        ([samples_n, modes,T,2], [samples_n, modes,T,2])
+        '''
+        return res_cls, res_reg, res_aux 
 
 
 class Simpl(nn.Module):
@@ -591,13 +613,18 @@ class Simpl(nn.Module):
             self.apply(init_weights)
 
     def forward(self, data):
+        '''
+        actors: (all_Num, 3, 20)    all_Num = batch_size * sample_agent_num
+        actor_idcs: [tensor([0, 1, 2, 3]), tensor([ 4,  5,  6,  7,  8,  9, 10])] 每个sample(pkl)的agent在actors对应的idx
+        '''
         actors, actor_idcs, lanes, lane_idcs, rpe = data
 
         # * actors/lanes encoding
         actors = self.actor_net(actors)  # output: [N_{actor}, 128]
-        lanes = self.lane_net(lanes)  # output: [N_{lane}, 128]
+
+        lanes = self.lane_net(lanes.float())  # output: [N_{lane}, 128]
         # * fusion
-        actors, lanes, _ = self.fusion_net(actors, actor_idcs, lanes, lane_idcs, rpe)
+        actors, lanes, _ = self.fusion_net(actors, actor_idcs, lanes, lane_idcs, rpe)#维度没有任何改变
         # * decoding
         out = self.pred_net(actors, actor_idcs)
 
@@ -621,17 +648,89 @@ class Simpl(nn.Module):
 
         return actors, actor_idcs, lanes, lane_idcs, rpe
 
-    def post_process(self, out):
+
+
+
+    def post_process(self, out, data,draw):
+        
         post_out = dict()
         res_cls = out[0]
         res_reg = out[1]
+        res_aux = out[2]
+        reg,cls,param = [], [], []
+        for i in range(len(res_reg)):# bs
+            ###########################################################
+            if False:
+                # 画一下 以个batch里所有agent的OBS、FUT和PRED
+
+                # obs
+                all_agent_num = data['PAD_FUT'][i].shape[0]
+                pred_flag = data['PAD_FUT'][i].sum(-1) > 30 # k, 50 -> k
+
+                one_batch_all_agent_obs_traj = data['TRAJS_OBS'][i]# k,20,2
+                one_batch_all_agent_obs_traj_pad = data['PAD_OBS'][i] # k, 20
+
+                one_batch_all_agent_obs_point = data['TRAJS_CTRS'][i] # k,2
+                one_batch_all_agent_obs_point_vec = data['TRAJS_VECS'][i] # k,2
+                
+                # fut
+                one_batch_all_agent_fut_traj = data['TRAJS_FUT'][i] # k, 50, 2
+
+                # pred
+                one_batch_pred_traj = res_reg[i] # k,6,T,2
+                mode_num = one_batch_pred_traj.shape[1]
+
+
+
+                fig, ax = plt.subplots(figsize=(10,10),dpi=200)
+                for j in range(all_agent_num):
+                    transform=(one_batch_all_agent_obs_point[j], one_batch_all_agent_obs_point_vec[j])
+                    agent_obs_traj = one_batch_all_agent_obs_traj[j][one_batch_all_agent_obs_traj_pad[j].bool()]
+                    agent_fut_traj = one_batch_all_agent_fut_traj[j]
+                    if pred_flag[j]: # 有未来轨迹
+                        print("有未来轨迹")
+                        pu.draw_traj(ax, agent_obs_traj, transform, color='blue',text=f"bs:{i}, j:{j}_obs")
+                        pu.draw_traj(ax, agent_fut_traj, transform, color='red',text=f"bs:{i}, j:{j}_fut")
+                        for m in range(mode_num):
+                            pu.draw_traj(ax, one_batch_pred_traj[j][m], transform, color='green',text=f"bs:{i}, j:{j}_fut, mode:{m}")
+
+                    else:
+                        pass
+                        print("无未来轨迹")
+                        pu.draw_traj(ax, agent_obs_traj, transform,color='tan',text=f"bs:{i}, no future")
+                output_dir = "tmp"
+                output_dir = Path(output_dir)
+                if not output_dir.exists():
+                    output_dir.mkdir(parents=True)
+                    print(f"mkdir {output_dir}")
+                fig_name = f'draw_test_{time_utils.get_cur_time_string()}'
+                    
+                fig_name += ".jpg"
+                fig_save_path = output_dir / fig_name
+                fig.savefig(fig_save_path)
+                print(f"draw candiadate_refpath at {fig_save_path.resolve()}")
+
+
+
+            ###########################################################
+
+
+            flag = data['PAD_FUT'][i].sum(-1) >= 50 #  b,k, 50-> k,50 -> k -> k
+            param.append(res_aux[i][1][flag])# b,2,k,6,6,2 -> 2,k,6,6,2->k,6,6,2->v,6,6,2
+            reg.append(res_reg[i][flag]) # k,6,50,2 -> v,6,50,2
+            cls.append(res_cls[i][flag]) # k,50 -> v,50
 
         # get prediction results for target vehicles only
-        reg = torch.stack([trajs[0] for trajs in res_reg], dim=0)
-        cls = torch.stack([probs[0] for probs in res_cls], dim=0)
+        reg = torch.cat(reg, dim=0) # all_v,6, 50,2
+        cls = torch.cat(cls, dim=0) # all_v,50
+        param = torch.cat(param, dim=0) # all_v, 6,6,2
+        # pu.draw_here(data,out,"tmp")
+        # reg = torch.stack([trajs[0] for trajs in res_reg], dim=0) # stack (modes,T,2).. -> (B, modes,T,2)
+        # cls = torch.stack([probs[0] for probs in res_cls], dim=0) # stack (modes) ... -> (B,modes)
 
         post_out['out_raw'] = out
         post_out['traj_pred'] = reg  # batch x n_mod x pred_len x 2
         post_out['prob_pred'] = cls  # batch x n_mod
+        post_out['param_pred'] = param 
 
         return post_out

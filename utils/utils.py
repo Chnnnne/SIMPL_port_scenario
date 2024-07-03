@@ -205,7 +205,7 @@ class AverageMeterForDict(object):
     def reset(self):
         self.metrics = {}
 
-    def update(self, elem, n=1):
+    def update(self, elem, n=1):# loss_out:  cls_loss:1...  reg_loss:... loss:...
         for key, val in elem.items():
             if not key in self.metrics:
                 self.metrics[key] = AverageMeter()

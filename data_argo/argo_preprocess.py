@@ -36,10 +36,13 @@ class ArgoPreproc():
         self.SEG_LENGTH = 10.0  # approximated lane segment length
         self.SEG_N_NODE = 10
 
-        self.argo_map = ArgoverseMap()
+        # self.argo_map = ArgoverseMap()
+        self.argo_map = None
 
         if self.debug:
-            self.map_vis = ArgoMapVisualizer()
+            # self.map_vis = ArgoMapVisualizer()
+            self.map_vis = None
+            
 
     def print(self, info):
         if self.verbose:
@@ -49,12 +52,27 @@ class ArgoPreproc():
         city_name = df['CITY_NAME'].values[0]
 
         # get trajectories
-        ts, trajs_ori, pad_flags = self.get_trajectories(df, city_name)
+        ts, trajs_ori, pad_flags = self.get_trajectories(df, city_name) # trajs_ori  (num of obejct, 50, 2)
 
         # get origin and rot
-        orig, rot = self.get_origin_rotation(trajs_ori[0])  # * ego-centric
-        trajs_ori = (trajs_ori - orig).dot(rot)
+        orig, rot = self.get_origin_rotation(trajs_ori[0])  # * ego-centric  orig是agent 20frame那一刻的位置，rot是0帧到20帧的连接rot
+        trajs_ori = (trajs_ori - orig).dot(rot) # 旋转变化+平移变化：以agent自车为中心，vec方向为x轴方向
+        '''
+        agent_traj = trajs_ori[0]
+        new_agent_traj = (agent_traj - orig).dot(rot) # 旋转变化+平移变化：以agent自车为中心，vec方向为x轴方向
+        
+        fig1,axes = plt.subplots(1,2,figsize=(10,10),dpi=1000)
+        axes[0].plot(agent_traj[:,0], agent_traj[:,1], 'o b',ms=3)
+        axes[0].scatter(agent_traj[0][0],agent_traj[0][1],c='purple',s=150,marker='x')
+        axes[0].scatter(agent_traj[self.args.obs_len - 1][0],agent_traj[self.args.obs_len - 1][1],s=150,c='black',marker='X')
 
+        axes[1].plot(new_agent_traj[:,0], new_agent_traj[:,1], 'o b',ms=3)
+        axes[1].scatter(new_agent_traj[0][0],new_agent_traj[0][1],c='purple',marker='X',s=150)
+        axes[1].scatter(new_agent_traj[self.args.obs_len - 1][0],new_agent_traj[self.args.obs_len - 1][1],c='black',marker='X',s=150)
+        
+
+        fig1.savefig("my_fig.png")
+        '''
         # ~ normalize trajs
         trajs_norm = []
         trajs_ctrs = []
@@ -65,11 +83,12 @@ class ArgoPreproc():
             theta = np.arctan2(act_vec[1], act_vec[0])
             act_rot = np.array([[np.cos(theta), -np.sin(theta)],
                                 [np.sin(theta), np.cos(theta)]])
-            trajs_norm.append((traj - act_orig).dot(act_rot))
-            trajs_ctrs.append(act_orig)
-            trajs_vecs.append(np.array([np.cos(theta), np.sin(theta)]))
 
-        trajs = np.array(trajs_norm)
+            trajs_norm.append((traj - act_orig).dot(act_rot))# 以每个object的obs_point为中心并旋转
+            trajs_ctrs.append(act_orig) # 每个object的obs_point
+            trajs_vecs.append(np.array([np.cos(theta), np.sin(theta)]))# 每个obejct的obs_point和轨迹开始点的向量
+
+        trajs = np.array(trajs_norm) # array ->ndarray
         trajs_ctrs = np.array(trajs_ctrs)
         trajs_vecs = np.array(trajs_vecs)
 
@@ -79,10 +98,12 @@ class ArgoPreproc():
         lane_graph = self.get_lane_graph(seq_id, df, city_name, orig, rot, lane_ids)
 
         # find relevant lanes
-        trajs_ori_flat = trajs_ori.reshape(-1, 2)
+        trajs_ori_flat = trajs_ori.reshape(-1, 2) # (num of object, 50, 2) -> (points,2)
         lane_ctrs = lane_graph['lane_ctrs']
         # print("trajs_ori_flat: ", trajs_ori_flat.shape, "lane_ctrs: ", lane_ctrs.shape)
-        dists = spatial.distance.cdist(trajs_ori_flat, lane_ctrs)  # calculate distance
+        # calculate distance  trajs_ori_flat是csv读取到的每个object的坐标，lane_ctrs是每个seg取的中点
+        # dists shape(points num, seg num)
+        dists = spatial.distance.cdist(trajs_ori_flat, lane_ctrs)  
         rel_lane_flags = np.min(dists, axis=0) < self.REL_LANE_THRES  # find lanes that are not close to the trajectory
         lane_graph['rel_lane_flags'] = rel_lane_flags  # [True False True ...]
 
@@ -99,7 +120,8 @@ class ArgoPreproc():
             self.plot_trajs(ax, trajs, trajs_ctrs, trajs_vecs, pad_flags, orig, rot, vis_map=vis_map)
             self.plot_lane_graph(ax, city_name, orig, rot, lane_ids, lane_graph, vis_map=vis_map)
             ax.set_title("{} {}".format(seq_id, city_name))
-            plt.show()
+            # plt.show()
+            plt.savefig("fig_here")
 
         return data, headers
 
@@ -117,14 +139,22 @@ class ArgoPreproc():
     def get_trajectories(self,
                          df: pd.DataFrame,
                          city_name: str):
+        '''
+        一个csv对应的df中，有agent other av三种类型，
+        agent和av都是全量50frame(during train or val) 或者20fram(during test)
+        它们对应的轨迹都是(50,2)存储在av/agent_traj中
+        而other type的数据不一定是全量的，因此就存在padd
+        过滤在20 frame前没出现的，过滤在20 frame那一刻没出现的，过滤太远的。
+        剩下的数据（包含av和agent）（扩充和pad之后的traj和pad）存储进trajs[N, 50(20), 2], pad_flags[N, 50(20)]
+        '''
         ts = np.sort(np.unique(df['TIMESTAMP'].values)).astype(float)
         t_obs = ts[self.args.obs_len - 1]
 
-        agent_traj = df[df["OBJECT_TYPE"] == "AGENT"]
-        agent_traj = np.stack((agent_traj['X'].values, agent_traj['Y'].values), axis=1).astype(float)
+        agent_traj = df[df["OBJECT_TYPE"] == "AGENT"] # df(line nums, 6) -> (50, 6)
+        agent_traj = np.stack((agent_traj['X'].values, agent_traj['Y'].values), axis=1).astype(float) # (50,2)
         agent_traj[:, 0:2] = agent_traj[:, 0:2]
 
-        av_traj = df[df["OBJECT_TYPE"] == "AV"]
+        av_traj = df[df["OBJECT_TYPE"] == "AV"] # (50, 6)
         av_traj = np.stack((av_traj['X'].values, av_traj['Y'].values), axis=1).astype(float)
         av_traj[:, 0:2] = av_traj[:, 0:2]
 
@@ -144,26 +174,26 @@ class ArgoPreproc():
                 continue
 
             ts_mot = np.array(mot_traj['TIMESTAMP'].values).astype(float)
-            mot_traj = np.stack((mot_traj['X'].values, mot_traj['Y'].values), axis=1).astype(float)
+            mot_traj = np.stack((mot_traj['X'].values, mot_traj['Y'].values), axis=1).astype(float)# (n, 2)
 
             # ~ remove traj after t_obs
             if np.all(ts_mot > t_obs):
                 continue
 
-            _, idcs, _ = np.intersect1d(ts, ts_mot, return_indices=True)
+            _, idcs, _ = np.intersect1d(ts, ts_mot, return_indices=True) # (50) intersect with(n)
             padded = np.zeros_like(ts)
             padded[idcs] = 1
 
             if not padded[self.args.obs_len - 1]:  # !
                 continue
 
-            mot_traj_pad = np.full(agent_traj[:, :2].shape, None)
-            mot_traj_pad[idcs] = mot_traj
+            mot_traj_pad = np.full(agent_traj[:, :2].shape, None) #(50, 2)
+            mot_traj_pad[idcs] = mot_traj #(50,2) 有数据的地方是原本的xy坐标，没数据的地方是NONE
 
-            mot_traj_pad = self.padding_traj_nn(mot_traj_pad)
+            mot_traj_pad = self.padding_traj_nn(mot_traj_pad) ##(50,2) 有数据的地方是原本的xy坐标，没数据的地方被赋值成开头的数据
             assert np.all(mot_traj_pad[idcs] == mot_traj), "Padding error"
 
-            mot_traj = np.stack((mot_traj_pad[:, 0], mot_traj_pad[:, 1]), axis=1)
+            mot_traj = np.stack((mot_traj_pad[:, 0], mot_traj_pad[:, 1]), axis=1) # 无意义
             mot_traj[:, 0:2] = mot_traj[:, 0:2]
 
             mot_ctr = mot_traj[self.args.obs_len - 1]
@@ -216,40 +246,40 @@ class ArgoPreproc():
         for lane_id in lane_ids:
             lane = lanes[lane_id]
 
-            cl_raw = lane.centerline
-            cl_ls = LineString(cl_raw)
+            cl_raw = lane.centerline # 取一条道路的中线上的点
+            cl_ls = LineString(cl_raw) # （10,2）转化成LineString
 
-            num_segs = np.max([int(np.floor(cl_ls.length / self.SEG_LENGTH)), 1])
-            ds = cl_ls.length / num_segs
+            num_segs = np.max([int(np.floor(cl_ls.length / self.SEG_LENGTH)), 1])# 初定10m为一个SEG
+            ds = cl_ls.length / num_segs # 每个seg最终的distance
             for i in range(num_segs):
                 s_lb = i * ds
                 s_ub = (i + 1) * ds
                 num_sub_segs = self.SEG_N_NODE
 
                 cl_pts = []
-                for s in np.linspace(s_lb, s_ub, num_sub_segs + 1):
-                    cl_pts.append(cl_ls.interpolate(s))
-                ctrln = np.array(LineString(cl_pts).coords)
-                ctrln[:, 0:2] = (ctrln[:, 0:2] - orig).dot(rot)
+                for s in np.linspace(s_lb, s_ub, num_sub_segs + 1):# 每个Seg再分SEG_N_NODE份
+                    cl_pts.append(cl_ls.interpolate(s)) # cl_pts是单个seg上的一些采样点(11,2)
+                ctrln = np.array(LineString(cl_pts).coords)# 转化为LineString  ctrln(11, 2)
+                ctrln[:, 0:2] = (ctrln[:, 0:2] - orig).dot(rot)#将道路信息转化为以agent为中心的坐标
 
-                anch_pos = np.mean(ctrln, axis=0)
-                anch_vec = (ctrln[-1] - ctrln[0]) / np.linalg.norm(ctrln[-1] - ctrln[0])
+                anch_pos = np.mean(ctrln, axis=0)# 为一个Seg上的平均(x,y)
+                anch_vec = (ctrln[-1] - ctrln[0]) / np.linalg.norm(ctrln[-1] - ctrln[0])# 一个Seg上的方向向量
                 anch_rot = np.array([[anch_vec[0], -anch_vec[1]],
-                                     [anch_vec[1], anch_vec[0]]])
+                                     [anch_vec[1], anch_vec[0]]])# 一个Seg的旋转矩阵
 
-                lane_ctrs.append(anch_pos)
+                lane_ctrs.append(anch_pos) # 每个Seg上的中点所组成的list
                 lane_vecs.append(anch_vec)
 
-                ctrln[:, 0:2] = (ctrln[:, 0:2] - anch_pos).dot(anch_rot)
+                ctrln[:, 0:2] = (ctrln[:, 0:2] - anch_pos).dot(anch_rot) # seg上的点都转化为以中点为坐标原点
 
-                ctrs = np.asarray((ctrln[:-1] + ctrln[1:]) / 2.0, np.float32)
+                ctrs = np.asarray((ctrln[:-1] + ctrln[1:]) / 2.0, np.float32)# seg点的基础上再采样求向量和中点（10,2）
                 vecs = np.asarray(ctrln[1:] - ctrln[:-1], np.float32)
-                node_ctrs.append(ctrs)  # middle point
+                node_ctrs.append(ctrs)  # middle point  node_ctrs是每个Seg上的点list的list
                 node_vecs.append(vecs)
 
                 # ~ has left/right neighbor
                 if lane.l_neighbor_id is None:
-                    # w/o left neighbor
+                    # w/o without left neighbor
                     left.append(np.zeros(num_sub_segs, np.float32))
                 else:
                     left.append(np.ones(num_sub_segs, np.float32))

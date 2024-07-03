@@ -29,7 +29,7 @@ class Visualizer():
         res_cls = post_out['out_raw'][0]
         res_reg = post_out['out_raw'][1]
 
-        _, ax = plt.subplots(figsize=(12, 12))
+        fig, ax = plt.subplots(figsize=(12, 12))
         ax.axis('equal')
         ax.set_title('{}-{}'.format(seq_id, city_name))
 
@@ -142,3 +142,6 @@ class Visualizer():
 
         plt.tight_layout()
         plt.show()
+        # fig.savefig("11.png")
+        # print("draw ok")
+        # exit()
